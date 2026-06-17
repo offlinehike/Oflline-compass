@@ -660,19 +660,43 @@ export default function TrailLedger() {
     });
 
     // Guide pay payable: sum of unpaid guide-days (up to & incl. today). Paid
-    // guide-days have already debited the bank (handled in markGuidePaid).
+    // guide-days debit the account chosen when marked paid (Hand or Bank).
     const guidePaid = settings.guidePaid || {};
     let guidePayable = 0;
     let bankPaidToGuides = 0;
+    let handPaidToGuides = 0;
     Object.keys(reports).forEach((date) => {
       if (date > today) return;
       const owed = guidePayForDay(reports[date]);
       Object.entries(owed).forEach(([guide, amt]) => {
-        if (guidePaid[guidePayKey(date, guide)]) bankPaidToGuides += amt; // already paid from bank
-        else guidePayable += amt;                                          // still owed
+        const rec = guidePaid[guidePayKey(date, guide)];
+        if (rec) {
+          if (rec.paidFrom === "Hand") handPaidToGuides += amt;
+          else bankPaidToGuides += amt; // default to bank
+        } else {
+          guidePayable += amt;
+        }
       });
     });
-    bankFlow -= bankPaidToGuides; // paid guide wages have left the bank
+    bankFlow -= bankPaidToGuides;
+    handFlow -= handPaidToGuides;
+
+    // Manual adjustments (Fix 3): { id, date, account, amount, note, type: "in"|"out" }
+    const adjustments = settings.adjustments || [];
+    adjustments.forEach((adj) => {
+      if (!adj.date || adj.date > today) return;
+      const signed = adj.type === "in" ? Number(adj.amount) : -Number(adj.amount);
+      if (adj.account === "Hand") handFlow += signed;
+      else bankFlow += signed;
+    });
+
+    // Ad-hoc expenses (Fix 4): { id, date, account, amount, category, note }
+    const adhocExpenses = settings.adhocExpenses || [];
+    adhocExpenses.forEach((exp) => {
+      if (!exp.date || exp.date > today) return;
+      if (exp.account === "Hand") handFlow -= Number(exp.amount) || 0;
+      else bankFlow -= Number(exp.amount) || 0;
+    });
 
     // Fixed monthly costs total
     const fixedMonthly = (settings.fixedCosts || []).reduce((s, c) => s + (Number(c.amount) || 0), 0);
@@ -816,8 +840,8 @@ export default function TrailLedger() {
     return { total, count };
   };
 
-  // Mark a revenue month's Freshverde bookings as paid, and add the received
-  // amount to the bank balance. (Freshverde pays ~5th of the following month.)
+  // Mark a revenue month's Freshverde bookings as paid, and record the received
+  // amount as a bank adjustment (NOT by mutating bankBalance).
   const settleFreshverde = (ym, amountReceived) => {
     setReports((prev) => {
       const next = { ...prev };
@@ -829,32 +853,44 @@ export default function TrailLedger() {
       });
       return next;
     });
-    setSettings((s) => ({
-      ...s,
-      bankBalance: String((Number(s.bankBalance) || 0) + (Number(amountReceived) || 0)),
-      bankAsOf: todayISO(),
-    }));
+    // Record as a bank-in adjustment so cashflow picks it up without touching bankBalance
+    if (Number(amountReceived) > 0) {
+      setSettings((s) => {
+        const adj = s.adjustments || [];
+        return {
+          ...s,
+          adjustments: [...adj, {
+            id: Date.now(),
+            date: todayISO(),
+            account: "Bank",
+            type: "in",
+            amount: String(amountReceived),
+            note: `Freshverde settlement — ${ym}`,
+          }],
+        };
+      });
+    }
   };
 
-  // Mark a guide as paid for a given day: stamp it and debit the bank by the
-  // amount owed (guide wages are paid from the bank).
-  const markGuidePaid = (date, guide, amount) => {
+  // Mark a guide as paid for a given day.
+  // paidFrom: "Bank" | "Hand" — determines which account is debited.
+  // bankBalance is intentionally NOT touched here — the cashflow
+  // calculation derives the running balance from flows, not mutations.
+  const markGuidePaid = (date, guide, amount, paidFrom = "Bank") => {
     setSettings((s) => ({
       ...s,
-      guidePaid: { ...(s.guidePaid || {}), [`${date}|${guide}`]: { paidOn: todayISO(), amount } },
-      bankBalance: String((Number(s.bankBalance) || 0) - (Number(amount) || 0)),
-      bankAsOf: todayISO(),
+      guidePaid: {
+        ...(s.guidePaid || {}),
+        [`${date}|${guide}`]: { paidOn: todayISO(), amount, paidFrom },
+      },
     }));
   };
-  // Undo a guide payment (refunds the bank).
+  // Undo a guide payment — no balance mutation needed since cashflow derives it.
   const unmarkGuidePaid = (date, guide) => {
     setSettings((s) => {
       const gp = { ...(s.guidePaid || {}) };
-      const rec = gp[`${date}|${guide}`];
       delete gp[`${date}|${guide}`];
-      const refund = rec && rec.amount ? Number(rec.amount) : 0;
-      return { ...s, guidePaid: gp,
-        bankBalance: String((Number(s.bankBalance) || 0) + refund), bankAsOf: todayISO() };
+      return { ...s, guidePaid: gp };
     });
   };
 
@@ -1094,7 +1130,8 @@ export default function TrailLedger() {
         ) : tab === "cashflow" ? (
           <CashFlow cf={cashflow} settings={settings} setSettings={setSettings}
             freshverdeDueFor={freshverdeDueFor} settleFreshverde={settleFreshverde}
-            buildInvoice={buildInvoice} nextInvoiceNo={nextInvoiceNo} year={year} month={month} />
+            buildInvoice={buildInvoice} nextInvoiceNo={nextInvoiceNo} year={year} month={month}
+            reports={reports} />
         ) : (
           <GuidesTab byStaff={stats.byStaff} month={month} year={year}
             pending={pendingGuidePay} onMarkPaid={markGuidePaid} onUnmark={unmarkGuidePaid}
@@ -1258,7 +1295,7 @@ function CashSnapshot({ cf }) {
 }
 
 // ── Cash Flow tab ──────────────────────────────────────────────────────
-function CashFlow({ cf, settings, setSettings, freshverdeDueFor, settleFreshverde, buildInvoice, nextInvoiceNo, year, month }) {
+function CashFlow({ cf, settings, setSettings, freshverdeDueFor, settleFreshverde, buildInvoice, nextInvoiceNo, year, month, reports }) {
   const mLabel = (ym) => {
     const [y, m] = ym.split("-").map(Number);
     return MONTHS[m - 1].slice(0, 3);
@@ -1354,7 +1391,282 @@ function CashFlow({ cf, settings, setSettings, freshverdeDueFor, settleFreshverd
       </section>
 
       <FixedCosts settings={settings} setSettings={setSettings} />
+
+      <ManualAdjustments settings={settings} setSettings={setSettings} />
+
+      <AdhocExpenses settings={settings} setSettings={setSettings} />
+
+      <StaffPaymentsCashflow cf={cf} settings={settings} reports={reports} />
     </>
+  );
+}
+
+// ── Fix 3: Manual bank/hand balance adjustment ─────────────────────────
+function ManualAdjustments({ settings, setSettings }) {
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ date: todayISO(), account: "Bank", type: "out", amount: "", note: "" });
+  const [saved, setSaved] = useState("");
+
+  const adjustments = settings.adjustments || [];
+
+  const add = () => {
+    if (!form.amount || !form.date) return;
+    setSettings((s) => ({
+      ...s,
+      adjustments: [...(s.adjustments || []), { ...form, id: Date.now(), amount: String(form.amount) }],
+    }));
+    setForm({ date: todayISO(), account: "Bank", type: "out", amount: "", note: "" });
+    setShowForm(false);
+    setSaved("Adjustment recorded.");
+    setTimeout(() => setSaved(""), 2500);
+  };
+
+  const remove = (id) => {
+    setSettings((s) => ({ ...s, adjustments: (s.adjustments || []).filter((a) => a.id !== id) }));
+  };
+
+  const fmtDate = (iso) => {
+    const d = new Date(iso + "T00:00:00");
+    return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  };
+
+  return (
+    <section style={S.card}>
+      <h2 style={S.cardTitle}>Manual balance adjustments</h2>
+      <p style={S.hint}>Record transactions that happen outside the app — ATM withdrawals, bank charges, transfers, personal deposits.</p>
+
+      {adjustments.length > 0 && (
+        <div style={{ ...S.recvList, marginBottom: 12 }}>
+          {adjustments.slice().reverse().map((a) => (
+            <div key={a.id} style={S.recvRow}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 13, fontWeight: 600, color: "#334155" }}>{a.note || "Adjustment"}</span>
+                <span style={{ fontSize: 12, color: "#94A3B8" }}>{fmtDate(a.date)} · {a.account}</span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 14, fontWeight: 700, color: a.type === "in" ? "#16A34A" : "#DC2626" }}>
+                  {a.type === "in" ? "+" : "−"} {fmt(a.amount)}
+                </span>
+                <button onClick={() => remove(a.id)} style={S.fcDel}>✕</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {showForm ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={{ ...S.duemPayBtn, flex: 1, background: form.type === "out" ? "#DC2626" : "#E2E8F0", color: form.type === "out" ? "#fff" : "#334155" }}
+              onClick={() => setForm((f) => ({ ...f, type: "out" }))}>− Money out</button>
+            <button style={{ ...S.duemPayBtn, flex: 1, background: form.type === "in" ? "#16A34A" : "#E2E8F0", color: form.type === "in" ? "#fff" : "#334155" }}
+              onClick={() => setForm((f) => ({ ...f, type: "in" }))}>+ Money in</button>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={{ ...S.duemPayBtn, flex: 1, background: form.account === "Bank" ? "#2563EB" : "#E2E8F0", color: form.account === "Bank" ? "#fff" : "#334155" }}
+              onClick={() => setForm((f) => ({ ...f, account: "Bank" }))}>🏦 Bank</button>
+            <button style={{ ...S.duemPayBtn, flex: 1, background: form.account === "Hand" ? "#16A34A" : "#E2E8F0", color: form.account === "Hand" ? "#fff" : "#334155" }}
+              onClick={() => setForm((f) => ({ ...f, account: "Hand" }))}>💵 Hand</button>
+          </div>
+          <input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} style={S.input} />
+          <div style={S.bankRow}>
+            <span style={S.bankCur}>Rs</span>
+            <input type="number" inputMode="numeric" value={form.amount} placeholder="Amount"
+              onChange={(e) => setForm((f) => ({ ...f, amount: e.target.value }))} style={S.bankInput} />
+          </div>
+          <input value={form.note} placeholder="Note (e.g. ATM withdrawal, bank charge)"
+            onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))} style={S.input} />
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={{ ...S.settleBtn, flex: 2 }} onClick={add}>Save adjustment</button>
+            <button style={{ ...S.fcAdd, flex: 1 }} onClick={() => setShowForm(false)}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <button style={S.fcAdd} onClick={() => setShowForm(true)}>+ Add adjustment</button>
+      )}
+      {saved && <span style={S.pasteOk}>{saved}</span>}
+    </section>
+  );
+}
+
+// ── Fix 4: Ad-hoc expense entry ────────────────────────────────────────
+const ADHOC_CATS = ["Equipment", "Repairs", "Marketing", "Transport", "Accommodation", "Office", "Other"];
+
+function AdhocExpenses({ settings, setSettings }) {
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ date: todayISO(), account: "Bank", amount: "", category: "Equipment", note: "" });
+  const [saved, setSaved] = useState("");
+
+  const expenses = settings.adhocExpenses || [];
+
+  const add = () => {
+    if (!form.amount || !form.date) return;
+    setSettings((s) => ({
+      ...s,
+      adhocExpenses: [...(s.adhocExpenses || []), { ...form, id: Date.now(), amount: String(form.amount) }],
+    }));
+    setForm({ date: todayISO(), account: "Bank", amount: "", category: "Equipment", note: "" });
+    setShowForm(false);
+    setSaved("Expense recorded.");
+    setTimeout(() => setSaved(""), 2500);
+  };
+
+  const remove = (id) => {
+    setSettings((s) => ({ ...s, adhocExpenses: (s.adhocExpenses || []).filter((e) => e.id !== id) }));
+  };
+
+  const fmtDate = (iso) => {
+    const d = new Date(iso + "T00:00:00");
+    return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  };
+
+  const total = expenses.reduce((s, e) => s + (Number(e.amount) || 0), 0);
+
+  return (
+    <section style={S.card}>
+      <h2 style={S.cardTitle}>One-off expenses</h2>
+      <p style={S.hint}>Equipment purchases, repairs, one-time costs not tied to a specific trip.</p>
+
+      {expenses.length > 0 && (
+        <div style={{ ...S.recvList, marginBottom: 12 }}>
+          {expenses.slice().reverse().map((e) => (
+            <div key={e.id} style={S.recvRow}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 13, fontWeight: 600, color: "#334155" }}>{e.note || e.category}</span>
+                <span style={{ fontSize: 12, color: "#94A3B8" }}>{fmtDate(e.date)} · {e.category} · {e.account}</span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 14, fontWeight: 700, color: "#DC2626" }}>− {fmt(e.amount)}</span>
+                <button onClick={() => remove(e.id)} style={S.fcDel}>✕</button>
+              </div>
+            </div>
+          ))}
+          <div style={{ ...S.recvRow, ...S.recvTotal }}>
+            <span>Total one-off expenses</span>
+            <strong style={{ color: "#DC2626" }}>− {fmt(total)}</strong>
+          </div>
+        </div>
+      )}
+
+      {showForm ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={{ ...S.duemPayBtn, flex: 1, background: form.account === "Bank" ? "#2563EB" : "#E2E8F0", color: form.account === "Bank" ? "#fff" : "#334155" }}
+              onClick={() => setForm((f) => ({ ...f, account: "Bank" }))}>🏦 Bank</button>
+            <button style={{ ...S.duemPayBtn, flex: 1, background: form.account === "Hand" ? "#16A34A" : "#E2E8F0", color: form.account === "Hand" ? "#fff" : "#334155" }}
+              onClick={() => setForm((f) => ({ ...f, account: "Hand" }))}>💵 Hand</button>
+          </div>
+          <select value={form.category} onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))} style={S.input}>
+            {ADHOC_CATS.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} style={S.input} />
+          <div style={S.bankRow}>
+            <span style={S.bankCur}>Rs</span>
+            <input type="number" inputMode="numeric" value={form.amount} placeholder="Amount"
+              onChange={(e) => setForm((f) => ({ ...f, amount: e.target.value }))} style={S.bankInput} />
+          </div>
+          <input value={form.note} placeholder="Note (e.g. New harness, vehicle repair)"
+            onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))} style={S.input} />
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={{ ...S.settleBtn, flex: 2 }} onClick={add}>Save expense</button>
+            <button style={{ ...S.fcAdd, flex: 1 }} onClick={() => setShowForm(false)}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <button style={S.fcAdd} onClick={() => setShowForm(true)}>+ Add one-off expense</button>
+      )}
+      {saved && <span style={S.pasteOk}>{saved}</span>}
+    </section>
+  );
+}
+
+// ── Staff Payments in Cash Flow ────────────────────────────────────────
+// Shows guide wages as cash outflows (paid) and liabilities (pending).
+function StaffPaymentsCashflow({ cf, settings, reports }) {
+  const guidePaid = settings.guidePaid || {};
+  const today = todayISO();
+
+  // Build list of all paid guide payments across all dates
+  const paidEntries = [];
+  Object.keys(reports).forEach((date) => {
+    if (date > today) return;
+    const owed = guidePayForDay(reports[date]);
+    Object.entries(owed).forEach(([guide, amount]) => {
+      const key = `${date}|${guide}`;
+      if (guidePaid[key]) {
+        paidEntries.push({
+          date,
+          guide,
+          amount,
+          paidOn: guidePaid[key].paidOn || date,
+        });
+      }
+    });
+  });
+  paidEntries.sort((a, b) => (a.paidOn < b.paidOn ? 1 : -1));
+
+  const totalPaid = paidEntries.reduce((s, e) => s + e.amount, 0);
+  const totalPending = cf.guidePayable;
+
+  const fmtDate = (iso) => {
+    const d = new Date(iso + "T00:00:00");
+    return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  };
+
+  return (
+    <section style={S.card}>
+      <h2 style={S.cardTitle}>Staff payments — cash out</h2>
+      <p style={S.hint}>Guide wages recorded as cash outflows when marked paid in the Guides tab.</p>
+
+      <div style={S.insightGrid}>
+        <Insight
+          label="Paid out (wages)"
+          value={fmt(totalPaid)}
+          color="#DC2626"
+          sub="left bank/hand" />
+        <Insight
+          label="Still owed"
+          value={fmt(totalPending)}
+          color={totalPending > 0 ? "#D97706" : "#16A34A"}
+          sub={totalPending > 0 ? "liability" : "all paid"} />
+      </div>
+
+      {paidEntries.length > 0 ? (
+        <div style={{ marginTop: 16 }}>
+          <span style={S.subhead}>Payment log</span>
+          <div style={{ ...S.recvList, marginTop: 8 }}>
+            {paidEntries.map((e, i) => (
+              <div key={i} style={S.recvRow}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                  <span style={{ fontSize: 14, fontWeight: 600, color: "#334155" }}>{e.guide}</span>
+                  <span style={{ fontSize: 12, color: "#94A3B8" }}>
+                    Trip: {fmtDate(e.date)} · Paid: {fmtDate(e.paidOn)}
+                  </span>
+                </div>
+                <span style={{ fontSize: 14, fontWeight: 700, color: "#DC2626" }}>− {fmt(e.amount)}</span>
+              </div>
+            ))}
+            <div style={{ ...S.recvRow, ...S.recvTotal }}>
+              <span>Total wages paid out</span>
+              <strong style={{ color: "#DC2626" }}>− {fmt(totalPaid)}</strong>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <p style={{ ...S.empty, marginTop: 12 }}>
+          No guide payments recorded yet. Mark guides as paid in the Guides tab — they'll appear here as cash outflows.
+        </p>
+      )}
+
+      {totalPending > 0 && (
+        <div style={{ marginTop: 14, padding: "12px 14px", background: "#FFF7ED", borderRadius: 12, border: "1px solid #FED7AA" }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "#B45309" }}>⚠ Outstanding liability: {fmt(totalPending)}</span>
+          <p style={{ fontSize: 12, color: "#92400E", margin: "4px 0 0" }}>
+            Guide wages earned but not yet paid. Go to the Guides tab to settle.
+          </p>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1485,6 +1797,53 @@ function FixedCosts({ settings, setSettings }) {
   );
 }
 
+// ── Pending guide payment row with Hand/Bank choice ────────────────────
+function PendingPayRow({ p, fmtDay, onMarkPaid }) {
+  const [paidFrom, setPaidFrom] = useState("Bank");
+  const [confirming, setConfirming] = useState(false);
+
+  if (confirming) {
+    return (
+      <div style={{ ...S.duemRow, flexDirection: "column", gap: 10, alignItems: "stretch" }}>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <div style={S.duemInfo}>
+            <span style={S.duemGuide}>{p.guide}</span>
+            <span style={S.duemDate}>{fmtDay(p.date)}</span>
+          </div>
+          <span style={S.duemAmt}>{fmt(p.amount)}</span>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            style={{ ...S.duemPayBtn, background: paidFrom === "Bank" ? "#2563EB" : "#E2E8F0", color: paidFrom === "Bank" ? "#fff" : "#334155", flex: 1 }}
+            onClick={() => setPaidFrom("Bank")}>🏦 Bank</button>
+          <button
+            style={{ ...S.duemPayBtn, background: paidFrom === "Hand" ? "#16A34A" : "#E2E8F0", color: paidFrom === "Hand" ? "#fff" : "#334155", flex: 1 }}
+            onClick={() => setPaidFrom("Hand")}>💵 Hand</button>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button style={{ ...S.duemPayBtn, background: "#F97316", flex: 2 }}
+            onClick={() => { onMarkPaid(p.date, p.guide, p.amount, paidFrom); setConfirming(false); }}>
+            Confirm — pay from {paidFrom}
+          </button>
+          <button style={{ ...S.duemPayBtn, background: "#E2E8F0", color: "#334155", flex: 1 }}
+            onClick={() => setConfirming(false)}>Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={S.duemRow}>
+      <div style={S.duemInfo}>
+        <span style={S.duemGuide}>{p.guide}</span>
+        <span style={S.duemDate}>{fmtDay(p.date)}</span>
+      </div>
+      <span style={S.duemAmt}>{fmt(p.amount)}</span>
+      <button style={S.duemPayBtn} onClick={() => setConfirming(true)}>Mark paid</button>
+    </div>
+  );
+}
+
 // ── Guides performance tab ─────────────────────────────────────────────
 function GuidesTab({ byStaff, month, year, pending = [], onMarkPaid, onUnmark, guidePaid = {}, reports = {} }) {
   const [open, setOpen] = useState(null);
@@ -1509,17 +1868,10 @@ function GuidesTab({ byStaff, month, year, pending = [], onMarkPaid, onUnmark, g
         <h2 style={{ ...S.cardTitle, margin: 0 }}>Guide pay due</h2>
         <span style={S.payableTotal}>{fmt(pendingTotal)}</span>
       </div>
-      <p style={S.hint}>Wages owed but not yet paid. Marking paid debits your bank.</p>
+      <p style={S.hint}>Wages owed but not yet paid. Choose whether you pay from Hand (cash) or Bank.</p>
       <div style={S.payList}>
         {pending.map((p) => (
-          <div key={`${p.date}|${p.guide}`} style={S.duemRow}>
-            <div style={S.duemInfo}>
-              <span style={S.duemGuide}>{p.guide}</span>
-              <span style={S.duemDate}>{fmtDay(p.date)}</span>
-            </div>
-            <span style={S.duemAmt}>{fmt(p.amount)}</span>
-            <button style={S.duemPayBtn} onClick={() => onMarkPaid(p.date, p.guide, p.amount)}>Mark paid</button>
-          </div>
+          <PendingPayRow key={`${p.date}|${p.guide}`} p={p} fmtDay={fmtDay} onMarkPaid={onMarkPaid} />
         ))}
       </div>
     </section>
