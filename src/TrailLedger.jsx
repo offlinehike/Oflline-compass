@@ -87,19 +87,28 @@ const fmtShortDate = (iso) => {
 const countBookings = (reports) =>
   Object.values(reports || {}).reduce((n, arr) => n + (Array.isArray(arr) ? arr.length : 0), 0);
 
-// Merge two booking sets without losing anything: union per date, exact
-// duplicates removed. On a genuine conflict both versions are kept (a harmless
-// duplicate you can delete) rather than silently dropping one.
+// Order-independent serialization: sorts object keys recursively so the SAME
+// booking compares equal even after Supabase's jsonb storage reorders its keys.
+const stableKey = (v) => {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return "[" + v.map(stableKey).join(",") + "]";
+  return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + stableKey(v[k])).join(",") + "}";
+};
+
+// Merge two booking sets without losing anything: union per date, true
+// duplicates (same content, any key order) removed. On a genuine conflict both
+// versions are kept (a harmless duplicate you can delete) rather than dropping one.
 const mergeReports = (a, b) => {
   const out = {};
   const dates = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
   dates.forEach((d) => {
     const la = (a && a[d]) || [];
     const lb = (b && b[d]) || [];
-    const merged = [...la];
-    lb.forEach((item) => {
-      const key = JSON.stringify(item);
-      if (!merged.some((m) => JSON.stringify(m) === key)) merged.push(item);
+    const merged = [];
+    const seen = new Set();
+    [...la, ...lb].forEach((item) => {
+      const k = stableKey(item);
+      if (!seen.has(k)) { merged.push(item); seen.add(k); }
     });
     if (merged.length) out[d] = merged;
   });
@@ -513,16 +522,11 @@ export default function TrailLedger({ session }) {
 
         const cloudReports = (data && data.reports) || {};
         const cloudSettings = (data && data.settings) || {};
-        const localReports = reports;
-        const lc = countBookings(localReports);
-        const cc = countBookings(cloudReports);
 
-        // Choose the safe resolution: union when both have data, otherwise
-        // keep whichever is non-empty. Empty never wins.
-        let resolved;
-        if (lc > 0 && cc > 0) resolved = mergeReports(localReports, cloudReports);
-        else if (cc > 0) resolved = cloudReports;
-        else resolved = localReports; // cloud empty → keep local (may be empty too)
+        // Union of local + cloud, de-duplicated. A union can never drop data,
+        // so an empty side can't wipe a full one, and duplicates collapse.
+        const resolved = mergeReports(reports, cloudReports);
+        const resolvedSettings = { ...defaultSettings(), ...cloudSettings, ...settings };
 
         const resolvedSettings = { ...defaultSettings(), ...cloudSettings, ...settings };
 
