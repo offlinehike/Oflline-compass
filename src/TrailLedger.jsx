@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { supabase } from "./supabase";
+import { createClient } from "@supabase/supabase-js";
+
+// ── Supabase (auth + cloud sync) ───────────────────────────────────────
+const SUPABASE_URL = "https://ejxqywcamodooqwvqgrw.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_e9qM1qqsiel1qAU4CRO19g_rUp0hjv9";
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ── Constants ──────────────────────────────────────────────────────────
 const EXPENSE_CATS = [
@@ -53,46 +58,13 @@ const SETTINGS_KEY = "trailledger.settings.v1";
 // Auto-calc rates
 const FOOD_PER_PAX = 200; // Rs per person
 
-// ── Storage (localStorage for speed + Supabase for sync) ───────────────
+// ── Storage (localStorage; data persists on your device) ───────────────
 const load = () => {
   try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; }
   catch { return {}; }
 };
 const save = (data) => {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); } catch {}
-};
-
-// Supabase sync helpers
-const syncToSupabase = async (data, settings) => {
-  try {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
-    await supabase.from("user_data").upsert({
-      user_id: user.id,
-      reports: data,
-      settings: settings,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: "user_id" });
-  } catch (e) {
-    console.warn("Supabase sync failed (offline?)", e);
-  }
-};
-
-const loadFromSupabase = async () => {
-  try {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return null;
-    const { data, error } = await supabase
-      .from("user_data")
-      .select("reports, settings")
-      .eq("user_id", user.id)
-      .single();
-    if (error || !data) return null;
-    return data;
-  } catch (e) {
-    console.warn("Supabase load failed (offline?)", e);
-    return null;
-  }
 };
 
 const defaultSettings = () => ({ bankBalance: "", bankAsOf: todayISO(), cashInHand: "", cashAsOf: todayISO(), fixedCosts: [], guidePaid: {}, invoiceSeq: 5, company: { name: "OFFLINE Ltd", address: "Port-Louis", phone: "57310380", accNumber: "000072388064", accName: "Ally Darryl", bank: "Mauritius Commercial Bank" } });
@@ -102,6 +74,18 @@ const loadSettings = () => {
 };
 const saveSettings = (data) => {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(data)); } catch {}
+};
+
+// Cloud-sync bookkeeping: remember when we last reconciled with Supabase.
+const STAMP_KEY = "trailledger.syncedAt";
+const getStamp = () => { try { return localStorage.getItem(STAMP_KEY) || ""; } catch { return ""; } };
+const setStamp = (s) => { try { localStorage.setItem(STAMP_KEY, s); } catch {} };
+
+// Short, friendly date for the alert dropdown (e.g. "Sat 21 Jun").
+const fmtShortDate = (iso) => {
+  try {
+    return new Date(iso + "T00:00:00").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+  } catch { return iso; }
 };
 
 const fmt = (n) => "Rs " + Number(n || 0).toLocaleString("en-IN");
@@ -446,8 +430,79 @@ const guidePayForDay = (dayBookings) => {
 };
 const guidePayKey = (date, guide) => `${date}|${guide}`;
 
+// ── Auth gate ──────────────────────────────────────────────────────────
+// Wraps the whole app: shows the login screen until a Supabase session
+// exists, then renders the dashboard. Email + password only (no signup).
+export default function App() {
+  const [session, setSession] = useState(undefined); // undefined = still loading
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  if (session === undefined) {
+    return (
+      <div style={S.authWrap}>
+        <style>{CSS}</style>
+        <div style={S.authCard}>
+          <div style={S.authBrand}>OFFLINE</div>
+          <p style={S.authHint}>Loading…</p>
+        </div>
+      </div>
+    );
+  }
+  if (!session) return <Login />;
+  return <TrailLedger session={session} />;
+}
+
+function Login() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const submit = async () => {
+    if (busy) return;
+    setErr(""); setBusy(true);
+    const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+    setBusy(false);
+    if (error) setErr(error.message || "Couldn't sign in. Check your email and password.");
+  };
+
+  return (
+    <div style={S.authWrap}>
+      <style>{CSS}</style>
+      <div style={S.authCard}>
+        <div style={S.authBrand}>OFFLINE</div>
+        <p style={S.authHint}>Sign in to your dashboard</p>
+        <div style={S.field}>
+          <label style={S.fieldLabel}>Email</label>
+          <input
+            style={S.input} type="email" autoComplete="email" inputMode="email"
+            value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@email.com"
+          />
+        </div>
+        <div style={S.field}>
+          <label style={S.fieldLabel}>Password</label>
+          <input
+            style={S.input} type="password" autoComplete="current-password"
+            value={password} onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") submit(); }} placeholder="••••••••"
+          />
+        </div>
+        {err ? <div style={S.authErr}>{err}</div> : null}
+        <button style={{ ...S.primaryBtn, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={submit}>
+          {busy ? "Signing in…" : "Sign in"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── App ────────────────────────────────────────────────────────────────
-export default function TrailLedger() {
+function TrailLedger({ session }) {
   const now = new Date();
   const [year, setYear] = useState(now.getFullYear());
   const [month, setMonth] = useState(now.getMonth());
@@ -455,47 +510,93 @@ export default function TrailLedger() {
   const [sheet, setSheet] = useState(null); // { date, editIndex|null, form }
   const [tab, setTab] = useState("calendar"); // "calendar" | "dashboard" | "cashflow"
   const [settings, setSettings] = useState(loadSettings);
-  const [syncing, setSyncing] = useState(false);
-  const syncTimer = useRef(null);
 
-  // On mount: load from Supabase and merge with localStorage (cloud wins)
+  useEffect(() => saveSettings(settings), [settings]);
+
+  useEffect(() => save(reports), [reports]);
+
+  // Alert dropdown (guide-less bookings) open/closed.
+  const [alertOpen, setAlertOpen] = useState(false);
+
+  // ── Cloud sync (Supabase) ─────────────────────────────────────────────
+  // localStorage stays the instant, offline-first source; Supabase keeps every
+  // device in step. Pull once on login, then push (debounced) on every change.
+  const [syncState, setSyncState] = useState("idle"); // idle|syncing|saved|offline|error
+  const hydratedRef = useRef(false); // true after first cloud pull completes
+  const pushTimer = useRef(null);
+
   useEffect(() => {
+    if (!session) return;
+    let cancelled = false;
+    setSyncState("syncing");
     (async () => {
-      setSyncing(true);
-      const remote = await loadFromSupabase();
-      if (remote) {
-        if (remote.reports && Object.keys(remote.reports).length > 0) {
-          setReports(remote.reports);
-          save(remote.reports);
+      try {
+        const { data, error } = await supabase
+          .from("app_state")
+          .select("reports, settings, updated_at")
+          .eq("user_id", session.user.id)
+          .maybeSingle();
+        if (error) throw error;
+        const localStamp = getStamp();
+        const cloudNewer = !localStamp || Date.parse(data?.updated_at || 0) > Date.parse(localStamp);
+        if (!cancelled && data && cloudNewer) {
+          if (data.reports) { setReports(data.reports); save(data.reports); }
+          if (data.settings) {
+            const merged = { ...defaultSettings(), ...data.settings };
+            setSettings(merged); saveSettings(merged);
+          }
+          setStamp(data.updated_at || "");
         }
-        if (remote.settings) {
-          const merged = { ...defaultSettings(), ...remote.settings };
-          setSettings(merged);
-          saveSettings(merged);
-        }
+        if (!cancelled) setSyncState("saved");
+      } catch {
+        if (!cancelled) setSyncState(navigator.onLine ? "error" : "offline");
+      } finally {
+        hydratedRef.current = true;
       }
-      setSyncing(false);
     })();
-  }, []);
+    return () => { cancelled = true; };
+  }, [session]);
 
-  // Debounced Supabase sync whenever reports or settings change
+  // Push the whole state up, debounced. Waits for the first pull so the empty
+  // initial state can never overwrite real cloud data.
   useEffect(() => {
-    save(reports);
-    clearTimeout(syncTimer.current);
-    syncTimer.current = setTimeout(() => {
-      syncToSupabase(reports, settings);
-    }, 2000);
-    return () => clearTimeout(syncTimer.current);
-  }, [reports]);
+    if (!session || !hydratedRef.current) return;
+    if (pushTimer.current) clearTimeout(pushTimer.current);
+    pushTimer.current = setTimeout(async () => {
+      if (!navigator.onLine) { setSyncState("offline"); return; }
+      setSyncState("syncing");
+      const stamp = new Date().toISOString();
+      try {
+        const { error } = await supabase.from("app_state").upsert(
+          { user_id: session.user.id, reports, settings, updated_at: stamp },
+          { onConflict: "user_id" }
+        );
+        if (error) throw error;
+        setStamp(stamp); setSyncState("saved");
+      } catch {
+        setSyncState(navigator.onLine ? "error" : "offline");
+      }
+    }, 1200);
+    return () => { if (pushTimer.current) clearTimeout(pushTimer.current); };
+  }, [reports, settings, session]);
 
+  // When the connection comes back, flush whatever is on the device.
   useEffect(() => {
-    saveSettings(settings);
-    clearTimeout(syncTimer.current);
-    syncTimer.current = setTimeout(() => {
-      syncToSupabase(reports, settings);
-    }, 2000);
-    return () => clearTimeout(syncTimer.current);
-  }, [settings]);
+    const flush = async () => {
+      if (!session || !hydratedRef.current) return;
+      const stamp = new Date().toISOString();
+      try {
+        const { error } = await supabase.from("app_state").upsert(
+          { user_id: session.user.id, reports, settings, updated_at: stamp },
+          { onConflict: "user_id" }
+        );
+        if (error) throw error;
+        setStamp(stamp); setSyncState("saved");
+      } catch { setSyncState("error"); }
+    };
+    window.addEventListener("online", flush);
+    return () => window.removeEventListener("online", flush);
+  }, [session, reports, settings]);
 
   // Rollups for the selected month
   const monthKeys = useMemo(() => {
@@ -660,43 +761,19 @@ export default function TrailLedger() {
     });
 
     // Guide pay payable: sum of unpaid guide-days (up to & incl. today). Paid
-    // guide-days debit the account chosen when marked paid (Hand or Bank).
+    // guide-days have already debited the bank (handled in markGuidePaid).
     const guidePaid = settings.guidePaid || {};
     let guidePayable = 0;
     let bankPaidToGuides = 0;
-    let handPaidToGuides = 0;
     Object.keys(reports).forEach((date) => {
       if (date > today) return;
       const owed = guidePayForDay(reports[date]);
       Object.entries(owed).forEach(([guide, amt]) => {
-        const rec = guidePaid[guidePayKey(date, guide)];
-        if (rec) {
-          if (rec.paidFrom === "Hand") handPaidToGuides += amt;
-          else bankPaidToGuides += amt; // default to bank
-        } else {
-          guidePayable += amt;
-        }
+        if (guidePaid[guidePayKey(date, guide)]) bankPaidToGuides += amt; // already paid from bank
+        else guidePayable += amt;                                          // still owed
       });
     });
-    bankFlow -= bankPaidToGuides;
-    handFlow -= handPaidToGuides;
-
-    // Manual adjustments (Fix 3): { id, date, account, amount, note, type: "in"|"out" }
-    const adjustments = settings.adjustments || [];
-    adjustments.forEach((adj) => {
-      if (!adj.date || adj.date > today) return;
-      const signed = adj.type === "in" ? Number(adj.amount) : -Number(adj.amount);
-      if (adj.account === "Hand") handFlow += signed;
-      else bankFlow += signed;
-    });
-
-    // Ad-hoc expenses (Fix 4): { id, date, account, amount, category, note }
-    const adhocExpenses = settings.adhocExpenses || [];
-    adhocExpenses.forEach((exp) => {
-      if (!exp.date || exp.date > today) return;
-      if (exp.account === "Hand") handFlow -= Number(exp.amount) || 0;
-      else bankFlow -= Number(exp.amount) || 0;
-    });
+    bankFlow -= bankPaidToGuides; // paid guide wages have left the bank
 
     // Fixed monthly costs total
     const fixedMonthly = (settings.fixedCosts || []).reduce((s, c) => s + (Number(c.amount) || 0), 0);
@@ -840,8 +917,8 @@ export default function TrailLedger() {
     return { total, count };
   };
 
-  // Mark a revenue month's Freshverde bookings as paid, and record the received
-  // amount as a bank adjustment (NOT by mutating bankBalance).
+  // Mark a revenue month's Freshverde bookings as paid, and add the received
+  // amount to the bank balance. (Freshverde pays ~5th of the following month.)
   const settleFreshverde = (ym, amountReceived) => {
     setReports((prev) => {
       const next = { ...prev };
@@ -853,44 +930,32 @@ export default function TrailLedger() {
       });
       return next;
     });
-    // Record as a bank-in adjustment so cashflow picks it up without touching bankBalance
-    if (Number(amountReceived) > 0) {
-      setSettings((s) => {
-        const adj = s.adjustments || [];
-        return {
-          ...s,
-          adjustments: [...adj, {
-            id: Date.now(),
-            date: todayISO(),
-            account: "Bank",
-            type: "in",
-            amount: String(amountReceived),
-            note: `Freshverde settlement — ${ym}`,
-          }],
-        };
-      });
-    }
-  };
-
-  // Mark a guide as paid for a given day.
-  // paidFrom: "Bank" | "Hand" — determines which account is debited.
-  // bankBalance is intentionally NOT touched here — the cashflow
-  // calculation derives the running balance from flows, not mutations.
-  const markGuidePaid = (date, guide, amount, paidFrom = "Bank") => {
     setSettings((s) => ({
       ...s,
-      guidePaid: {
-        ...(s.guidePaid || {}),
-        [`${date}|${guide}`]: { paidOn: todayISO(), amount, paidFrom },
-      },
+      bankBalance: String((Number(s.bankBalance) || 0) + (Number(amountReceived) || 0)),
+      bankAsOf: todayISO(),
     }));
   };
-  // Undo a guide payment — no balance mutation needed since cashflow derives it.
+
+  // Mark a guide as paid for a given day: stamp it and debit the bank by the
+  // amount owed (guide wages are paid from the bank).
+  const markGuidePaid = (date, guide, amount) => {
+    setSettings((s) => ({
+      ...s,
+      guidePaid: { ...(s.guidePaid || {}), [`${date}|${guide}`]: { paidOn: todayISO(), amount } },
+      bankBalance: String((Number(s.bankBalance) || 0) - (Number(amount) || 0)),
+      bankAsOf: todayISO(),
+    }));
+  };
+  // Undo a guide payment (refunds the bank).
   const unmarkGuidePaid = (date, guide) => {
     setSettings((s) => {
       const gp = { ...(s.guidePaid || {}) };
+      const rec = gp[`${date}|${guide}`];
       delete gp[`${date}|${guide}`];
-      return { ...s, guidePaid: gp };
+      const refund = rec && rec.amount ? Number(rec.amount) : 0;
+      return { ...s, guidePaid: gp,
+        bankBalance: String((Number(s.bankBalance) || 0) + refund), bankAsOf: todayISO() };
     });
   };
 
@@ -1085,17 +1150,35 @@ export default function TrailLedger() {
       <main style={S.main}>
         <MonthPicker year={year} month={month} setYear={setYear} setMonth={setMonth} />
 
+        {actionRequired.length > 0 && (
+          <div style={S.alertWrap}>
+            <button style={{ ...S.actionBanner, marginBottom: 0 }} onClick={() => setAlertOpen((o) => !o)}>
+              <span style={S.actionBannerIcon}>⚠</span>
+              <span style={S.actionBannerText}>
+                <strong>{actionRequired.length} booking{actionRequired.length !== 1 ? "s" : ""} need a guide</strong>
+                <span style={S.actionBannerSub}>Tap to choose which one to assign</span>
+              </span>
+              <span style={S.alertChevron}>{alertOpen ? "▲" : "▼"}</span>
+            </button>
+            {alertOpen && (
+              <div style={S.alertMenu}>
+                {actionRequired.map((b) => (
+                  <button
+                    key={`${b.date}|${b.idx}`}
+                    style={S.alertItem}
+                    onClick={() => { setAlertOpen(false); openSheet(b.date, b.idx); }}
+                  >
+                    <span style={S.alertItemMain}>{fmtShortDate(b.date)} · {b.activity}</span>
+                    <span style={S.alertItemSub}>{b.client || "—"} · {b.pax} pax · no guide</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {tab === "calendar" ? (
           <>
-            {actionRequired.length > 0 && (
-              <button style={S.actionBanner} onClick={() => openSheet(actionRequired[0].date, actionRequired[0].idx)}>
-                <span style={S.actionBannerIcon}>⚠</span>
-                <span style={S.actionBannerText}>
-                  <strong>{actionRequired.length} booking{actionRequired.length !== 1 ? "s" : ""} need a guide</strong>
-                  <span style={S.actionBannerSub}>Tap to assign — a trip with no guide can't run</span>
-                </span>
-              </button>
-            )}
             {pendingGuidePay.length > 0 && (
               <button style={S.payReminder} onClick={() => setTab("guides")}>
                 <span style={S.payReminderIcon}>⏰</span>
@@ -1115,7 +1198,6 @@ export default function TrailLedger() {
           </>
         ) : tab === "dashboard" ? (
           <>
-            <ActionRequired items={actionRequired} onOpen={(date, idx) => openSheet(date, idx)} />
             <CeoOverview stats={stats} prev={prevStats} cf={cashflow} settings={settings} />
             <CashSnapshot cf={cashflow} />
             <ProfitByActivity byActivity={stats.byActivity} />
@@ -1126,12 +1208,24 @@ export default function TrailLedger() {
               onExport={exportBackup} onImport={importBackup}
               onCSV={exportCSV} onClear={clearAll}
             />
+            <section style={S.card}>
+              <h2 style={S.cardTitle}>Account</h2>
+              <p style={S.hint}>
+                Signed in as {session.user.email} · {
+                  syncState === "saved" ? "All changes synced" :
+                  syncState === "syncing" ? "Syncing…" :
+                  syncState === "offline" ? "Offline — will sync when back online" :
+                  syncState === "error" ? "Sync issue — changes are saved on this device" :
+                  "Ready"
+                }
+              </p>
+              <button style={S.signOutBtn} onClick={() => supabase.auth.signOut()}>Sign out</button>
+            </section>
           </>
         ) : tab === "cashflow" ? (
           <CashFlow cf={cashflow} settings={settings} setSettings={setSettings}
             freshverdeDueFor={freshverdeDueFor} settleFreshverde={settleFreshverde}
-            buildInvoice={buildInvoice} nextInvoiceNo={nextInvoiceNo} year={year} month={month}
-            reports={reports} />
+            buildInvoice={buildInvoice} nextInvoiceNo={nextInvoiceNo} year={year} month={month} />
         ) : (
           <GuidesTab byStaff={stats.byStaff} month={month} year={year}
             pending={pendingGuidePay} onMarkPaid={markGuidePaid} onUnmark={unmarkGuidePaid}
@@ -1295,7 +1389,7 @@ function CashSnapshot({ cf }) {
 }
 
 // ── Cash Flow tab ──────────────────────────────────────────────────────
-function CashFlow({ cf, settings, setSettings, freshverdeDueFor, settleFreshverde, buildInvoice, nextInvoiceNo, year, month, reports }) {
+function CashFlow({ cf, settings, setSettings, freshverdeDueFor, settleFreshverde, buildInvoice, nextInvoiceNo, year, month }) {
   const mLabel = (ym) => {
     const [y, m] = ym.split("-").map(Number);
     return MONTHS[m - 1].slice(0, 3);
@@ -1391,282 +1485,7 @@ function CashFlow({ cf, settings, setSettings, freshverdeDueFor, settleFreshverd
       </section>
 
       <FixedCosts settings={settings} setSettings={setSettings} />
-
-      <ManualAdjustments settings={settings} setSettings={setSettings} />
-
-      <AdhocExpenses settings={settings} setSettings={setSettings} />
-
-      <StaffPaymentsCashflow cf={cf} settings={settings} reports={reports} />
     </>
-  );
-}
-
-// ── Fix 3: Manual bank/hand balance adjustment ─────────────────────────
-function ManualAdjustments({ settings, setSettings }) {
-  const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ date: todayISO(), account: "Bank", type: "out", amount: "", note: "" });
-  const [saved, setSaved] = useState("");
-
-  const adjustments = settings.adjustments || [];
-
-  const add = () => {
-    if (!form.amount || !form.date) return;
-    setSettings((s) => ({
-      ...s,
-      adjustments: [...(s.adjustments || []), { ...form, id: Date.now(), amount: String(form.amount) }],
-    }));
-    setForm({ date: todayISO(), account: "Bank", type: "out", amount: "", note: "" });
-    setShowForm(false);
-    setSaved("Adjustment recorded.");
-    setTimeout(() => setSaved(""), 2500);
-  };
-
-  const remove = (id) => {
-    setSettings((s) => ({ ...s, adjustments: (s.adjustments || []).filter((a) => a.id !== id) }));
-  };
-
-  const fmtDate = (iso) => {
-    const d = new Date(iso + "T00:00:00");
-    return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
-  };
-
-  return (
-    <section style={S.card}>
-      <h2 style={S.cardTitle}>Manual balance adjustments</h2>
-      <p style={S.hint}>Record transactions that happen outside the app — ATM withdrawals, bank charges, transfers, personal deposits.</p>
-
-      {adjustments.length > 0 && (
-        <div style={{ ...S.recvList, marginBottom: 12 }}>
-          {adjustments.slice().reverse().map((a) => (
-            <div key={a.id} style={S.recvRow}>
-              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                <span style={{ fontSize: 13, fontWeight: 600, color: "#334155" }}>{a.note || "Adjustment"}</span>
-                <span style={{ fontSize: 12, color: "#94A3B8" }}>{fmtDate(a.date)} · {a.account}</span>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <span style={{ fontSize: 14, fontWeight: 700, color: a.type === "in" ? "#16A34A" : "#DC2626" }}>
-                  {a.type === "in" ? "+" : "−"} {fmt(a.amount)}
-                </span>
-                <button onClick={() => remove(a.id)} style={S.fcDel}>✕</button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {showForm ? (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button style={{ ...S.duemPayBtn, flex: 1, background: form.type === "out" ? "#DC2626" : "#E2E8F0", color: form.type === "out" ? "#fff" : "#334155" }}
-              onClick={() => setForm((f) => ({ ...f, type: "out" }))}>− Money out</button>
-            <button style={{ ...S.duemPayBtn, flex: 1, background: form.type === "in" ? "#16A34A" : "#E2E8F0", color: form.type === "in" ? "#fff" : "#334155" }}
-              onClick={() => setForm((f) => ({ ...f, type: "in" }))}>+ Money in</button>
-          </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button style={{ ...S.duemPayBtn, flex: 1, background: form.account === "Bank" ? "#2563EB" : "#E2E8F0", color: form.account === "Bank" ? "#fff" : "#334155" }}
-              onClick={() => setForm((f) => ({ ...f, account: "Bank" }))}>🏦 Bank</button>
-            <button style={{ ...S.duemPayBtn, flex: 1, background: form.account === "Hand" ? "#16A34A" : "#E2E8F0", color: form.account === "Hand" ? "#fff" : "#334155" }}
-              onClick={() => setForm((f) => ({ ...f, account: "Hand" }))}>💵 Hand</button>
-          </div>
-          <input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} style={S.input} />
-          <div style={S.bankRow}>
-            <span style={S.bankCur}>Rs</span>
-            <input type="number" inputMode="numeric" value={form.amount} placeholder="Amount"
-              onChange={(e) => setForm((f) => ({ ...f, amount: e.target.value }))} style={S.bankInput} />
-          </div>
-          <input value={form.note} placeholder="Note (e.g. ATM withdrawal, bank charge)"
-            onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))} style={S.input} />
-          <div style={{ display: "flex", gap: 8 }}>
-            <button style={{ ...S.settleBtn, flex: 2 }} onClick={add}>Save adjustment</button>
-            <button style={{ ...S.fcAdd, flex: 1 }} onClick={() => setShowForm(false)}>Cancel</button>
-          </div>
-        </div>
-      ) : (
-        <button style={S.fcAdd} onClick={() => setShowForm(true)}>+ Add adjustment</button>
-      )}
-      {saved && <span style={S.pasteOk}>{saved}</span>}
-    </section>
-  );
-}
-
-// ── Fix 4: Ad-hoc expense entry ────────────────────────────────────────
-const ADHOC_CATS = ["Equipment", "Repairs", "Marketing", "Transport", "Accommodation", "Office", "Other"];
-
-function AdhocExpenses({ settings, setSettings }) {
-  const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ date: todayISO(), account: "Bank", amount: "", category: "Equipment", note: "" });
-  const [saved, setSaved] = useState("");
-
-  const expenses = settings.adhocExpenses || [];
-
-  const add = () => {
-    if (!form.amount || !form.date) return;
-    setSettings((s) => ({
-      ...s,
-      adhocExpenses: [...(s.adhocExpenses || []), { ...form, id: Date.now(), amount: String(form.amount) }],
-    }));
-    setForm({ date: todayISO(), account: "Bank", amount: "", category: "Equipment", note: "" });
-    setShowForm(false);
-    setSaved("Expense recorded.");
-    setTimeout(() => setSaved(""), 2500);
-  };
-
-  const remove = (id) => {
-    setSettings((s) => ({ ...s, adhocExpenses: (s.adhocExpenses || []).filter((e) => e.id !== id) }));
-  };
-
-  const fmtDate = (iso) => {
-    const d = new Date(iso + "T00:00:00");
-    return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
-  };
-
-  const total = expenses.reduce((s, e) => s + (Number(e.amount) || 0), 0);
-
-  return (
-    <section style={S.card}>
-      <h2 style={S.cardTitle}>One-off expenses</h2>
-      <p style={S.hint}>Equipment purchases, repairs, one-time costs not tied to a specific trip.</p>
-
-      {expenses.length > 0 && (
-        <div style={{ ...S.recvList, marginBottom: 12 }}>
-          {expenses.slice().reverse().map((e) => (
-            <div key={e.id} style={S.recvRow}>
-              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                <span style={{ fontSize: 13, fontWeight: 600, color: "#334155" }}>{e.note || e.category}</span>
-                <span style={{ fontSize: 12, color: "#94A3B8" }}>{fmtDate(e.date)} · {e.category} · {e.account}</span>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <span style={{ fontSize: 14, fontWeight: 700, color: "#DC2626" }}>− {fmt(e.amount)}</span>
-                <button onClick={() => remove(e.id)} style={S.fcDel}>✕</button>
-              </div>
-            </div>
-          ))}
-          <div style={{ ...S.recvRow, ...S.recvTotal }}>
-            <span>Total one-off expenses</span>
-            <strong style={{ color: "#DC2626" }}>− {fmt(total)}</strong>
-          </div>
-        </div>
-      )}
-
-      {showForm ? (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button style={{ ...S.duemPayBtn, flex: 1, background: form.account === "Bank" ? "#2563EB" : "#E2E8F0", color: form.account === "Bank" ? "#fff" : "#334155" }}
-              onClick={() => setForm((f) => ({ ...f, account: "Bank" }))}>🏦 Bank</button>
-            <button style={{ ...S.duemPayBtn, flex: 1, background: form.account === "Hand" ? "#16A34A" : "#E2E8F0", color: form.account === "Hand" ? "#fff" : "#334155" }}
-              onClick={() => setForm((f) => ({ ...f, account: "Hand" }))}>💵 Hand</button>
-          </div>
-          <select value={form.category} onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))} style={S.input}>
-            {ADHOC_CATS.map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} style={S.input} />
-          <div style={S.bankRow}>
-            <span style={S.bankCur}>Rs</span>
-            <input type="number" inputMode="numeric" value={form.amount} placeholder="Amount"
-              onChange={(e) => setForm((f) => ({ ...f, amount: e.target.value }))} style={S.bankInput} />
-          </div>
-          <input value={form.note} placeholder="Note (e.g. New harness, vehicle repair)"
-            onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))} style={S.input} />
-          <div style={{ display: "flex", gap: 8 }}>
-            <button style={{ ...S.settleBtn, flex: 2 }} onClick={add}>Save expense</button>
-            <button style={{ ...S.fcAdd, flex: 1 }} onClick={() => setShowForm(false)}>Cancel</button>
-          </div>
-        </div>
-      ) : (
-        <button style={S.fcAdd} onClick={() => setShowForm(true)}>+ Add one-off expense</button>
-      )}
-      {saved && <span style={S.pasteOk}>{saved}</span>}
-    </section>
-  );
-}
-
-// ── Staff Payments in Cash Flow ────────────────────────────────────────
-// Shows guide wages as cash outflows (paid) and liabilities (pending).
-function StaffPaymentsCashflow({ cf, settings, reports }) {
-  const guidePaid = settings.guidePaid || {};
-  const today = todayISO();
-
-  // Build list of all paid guide payments across all dates
-  const paidEntries = [];
-  Object.keys(reports).forEach((date) => {
-    if (date > today) return;
-    const owed = guidePayForDay(reports[date]);
-    Object.entries(owed).forEach(([guide, amount]) => {
-      const key = `${date}|${guide}`;
-      if (guidePaid[key]) {
-        paidEntries.push({
-          date,
-          guide,
-          amount,
-          paidOn: guidePaid[key].paidOn || date,
-        });
-      }
-    });
-  });
-  paidEntries.sort((a, b) => (a.paidOn < b.paidOn ? 1 : -1));
-
-  const totalPaid = paidEntries.reduce((s, e) => s + e.amount, 0);
-  const totalPending = cf.guidePayable;
-
-  const fmtDate = (iso) => {
-    const d = new Date(iso + "T00:00:00");
-    return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
-  };
-
-  return (
-    <section style={S.card}>
-      <h2 style={S.cardTitle}>Staff payments — cash out</h2>
-      <p style={S.hint}>Guide wages recorded as cash outflows when marked paid in the Guides tab.</p>
-
-      <div style={S.insightGrid}>
-        <Insight
-          label="Paid out (wages)"
-          value={fmt(totalPaid)}
-          color="#DC2626"
-          sub="left bank/hand" />
-        <Insight
-          label="Still owed"
-          value={fmt(totalPending)}
-          color={totalPending > 0 ? "#D97706" : "#16A34A"}
-          sub={totalPending > 0 ? "liability" : "all paid"} />
-      </div>
-
-      {paidEntries.length > 0 ? (
-        <div style={{ marginTop: 16 }}>
-          <span style={S.subhead}>Payment log</span>
-          <div style={{ ...S.recvList, marginTop: 8 }}>
-            {paidEntries.map((e, i) => (
-              <div key={i} style={S.recvRow}>
-                <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                  <span style={{ fontSize: 14, fontWeight: 600, color: "#334155" }}>{e.guide}</span>
-                  <span style={{ fontSize: 12, color: "#94A3B8" }}>
-                    Trip: {fmtDate(e.date)} · Paid: {fmtDate(e.paidOn)}
-                  </span>
-                </div>
-                <span style={{ fontSize: 14, fontWeight: 700, color: "#DC2626" }}>− {fmt(e.amount)}</span>
-              </div>
-            ))}
-            <div style={{ ...S.recvRow, ...S.recvTotal }}>
-              <span>Total wages paid out</span>
-              <strong style={{ color: "#DC2626" }}>− {fmt(totalPaid)}</strong>
-            </div>
-          </div>
-        </div>
-      ) : (
-        <p style={{ ...S.empty, marginTop: 12 }}>
-          No guide payments recorded yet. Mark guides as paid in the Guides tab — they'll appear here as cash outflows.
-        </p>
-      )}
-
-      {totalPending > 0 && (
-        <div style={{ marginTop: 14, padding: "12px 14px", background: "#FFF7ED", borderRadius: 12, border: "1px solid #FED7AA" }}>
-          <span style={{ fontSize: 13, fontWeight: 700, color: "#B45309" }}>⚠ Outstanding liability: {fmt(totalPending)}</span>
-          <p style={{ fontSize: 12, color: "#92400E", margin: "4px 0 0" }}>
-            Guide wages earned but not yet paid. Go to the Guides tab to settle.
-          </p>
-        </div>
-      )}
-    </section>
   );
 }
 
@@ -1797,53 +1616,6 @@ function FixedCosts({ settings, setSettings }) {
   );
 }
 
-// ── Pending guide payment row with Hand/Bank choice ────────────────────
-function PendingPayRow({ p, fmtDay, onMarkPaid }) {
-  const [paidFrom, setPaidFrom] = useState("Bank");
-  const [confirming, setConfirming] = useState(false);
-
-  if (confirming) {
-    return (
-      <div style={{ ...S.duemRow, flexDirection: "column", gap: 10, alignItems: "stretch" }}>
-        <div style={{ display: "flex", justifyContent: "space-between" }}>
-          <div style={S.duemInfo}>
-            <span style={S.duemGuide}>{p.guide}</span>
-            <span style={S.duemDate}>{fmtDay(p.date)}</span>
-          </div>
-          <span style={S.duemAmt}>{fmt(p.amount)}</span>
-        </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button
-            style={{ ...S.duemPayBtn, background: paidFrom === "Bank" ? "#2563EB" : "#E2E8F0", color: paidFrom === "Bank" ? "#fff" : "#334155", flex: 1 }}
-            onClick={() => setPaidFrom("Bank")}>🏦 Bank</button>
-          <button
-            style={{ ...S.duemPayBtn, background: paidFrom === "Hand" ? "#16A34A" : "#E2E8F0", color: paidFrom === "Hand" ? "#fff" : "#334155", flex: 1 }}
-            onClick={() => setPaidFrom("Hand")}>💵 Hand</button>
-        </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button style={{ ...S.duemPayBtn, background: "#F97316", flex: 2 }}
-            onClick={() => { onMarkPaid(p.date, p.guide, p.amount, paidFrom); setConfirming(false); }}>
-            Confirm — pay from {paidFrom}
-          </button>
-          <button style={{ ...S.duemPayBtn, background: "#E2E8F0", color: "#334155", flex: 1 }}
-            onClick={() => setConfirming(false)}>Cancel</button>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div style={S.duemRow}>
-      <div style={S.duemInfo}>
-        <span style={S.duemGuide}>{p.guide}</span>
-        <span style={S.duemDate}>{fmtDay(p.date)}</span>
-      </div>
-      <span style={S.duemAmt}>{fmt(p.amount)}</span>
-      <button style={S.duemPayBtn} onClick={() => setConfirming(true)}>Mark paid</button>
-    </div>
-  );
-}
-
 // ── Guides performance tab ─────────────────────────────────────────────
 function GuidesTab({ byStaff, month, year, pending = [], onMarkPaid, onUnmark, guidePaid = {}, reports = {} }) {
   const [open, setOpen] = useState(null);
@@ -1868,10 +1640,17 @@ function GuidesTab({ byStaff, month, year, pending = [], onMarkPaid, onUnmark, g
         <h2 style={{ ...S.cardTitle, margin: 0 }}>Guide pay due</h2>
         <span style={S.payableTotal}>{fmt(pendingTotal)}</span>
       </div>
-      <p style={S.hint}>Wages owed but not yet paid. Choose whether you pay from Hand (cash) or Bank.</p>
+      <p style={S.hint}>Wages owed but not yet paid. Marking paid debits your bank.</p>
       <div style={S.payList}>
         {pending.map((p) => (
-          <PendingPayRow key={`${p.date}|${p.guide}`} p={p} fmtDay={fmtDay} onMarkPaid={onMarkPaid} />
+          <div key={`${p.date}|${p.guide}`} style={S.duemRow}>
+            <div style={S.duemInfo}>
+              <span style={S.duemGuide}>{p.guide}</span>
+              <span style={S.duemDate}>{fmtDay(p.date)}</span>
+            </div>
+            <span style={S.duemAmt}>{fmt(p.amount)}</span>
+            <button style={S.duemPayBtn} onClick={() => onMarkPaid(p.date, p.guide, p.amount)}>Mark paid</button>
+          </div>
         ))}
       </div>
     </section>
@@ -3176,6 +2955,23 @@ const S = {
   actionBannerIcon: { fontSize: 20, color: "#DC2626" },
   actionBannerText: { flex: 1, display: "flex", flexDirection: "column", gap: 1, color: "#B91C1C" },
   actionBannerSub: { fontSize: 12, color: "#DC2626", fontWeight: 400 },
+
+  // Auth screen
+  authWrap: { fontFamily: "'Inter', system-ui, sans-serif", background: "#F1F3F5", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, color: INK },
+  authCard: { background: "#fff", width: "100%", maxWidth: 380, borderRadius: 18, padding: "28px 22px", boxShadow: "0 8px 30px rgba(15,23,42,.08)", display: "flex", flexDirection: "column", gap: 14 },
+  authBrand: { fontSize: 26, fontWeight: 900, letterSpacing: "0.12em", textAlign: "center", color: INK },
+  authHint: { fontSize: 14, color: "#64748B", textAlign: "center", margin: "0 0 4px" },
+  authErr: { fontSize: 13, color: "#B91C1C", background: "#FEF2F2", border: "1px solid #FCA5A5", borderRadius: 10, padding: "10px 12px" },
+
+  // Guide-less alert dropdown
+  alertWrap: { marginBottom: 14, position: "relative" },
+  alertChevron: { fontSize: 12, color: "#B91C1C", fontWeight: 700 },
+  alertMenu: { marginTop: 6, display: "flex", flexDirection: "column", gap: 6, background: "#fff", border: "1px solid #FCA5A5", borderRadius: 14, padding: 8, boxShadow: "0 6px 20px rgba(185,28,28,.10)", maxHeight: 280, overflowY: "auto" },
+  alertItem: { display: "flex", flexDirection: "column", gap: 2, textAlign: "left", padding: "11px 12px", border: "none", borderRadius: 10, background: "#FFF7F7", cursor: "pointer", font: "inherit", width: "100%" },
+  alertItemMain: { fontSize: 14, fontWeight: 700, color: "#0F172A" },
+  alertItemSub: { fontSize: 12, color: "#B91C1C" },
+
+  signOutBtn: { width: "100%", marginTop: 4, padding: "13px", border: "1px solid #CBD5E1", borderRadius: 13, background: "#fff", color: "#334155", fontSize: 15, fontWeight: 700, cursor: "pointer" },
   dataGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
   fab: { position: "fixed", bottom: 78, left: "50%", transform: "translateX(-50%)", zIndex: 9, padding: "13px 22px", border: "none", borderRadius: 26, background: ORANGE, color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer", boxShadow: "0 4px 14px rgba(232,116,59,.4)" },
   dataBtn: { display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 2, padding: "13px 14px", border: "1px solid #E2E8F0", borderRadius: 12, background: "#F8FAFC", cursor: "pointer", textAlign: "left", font: "inherit" },
