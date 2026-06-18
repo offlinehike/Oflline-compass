@@ -528,8 +528,6 @@ export default function TrailLedger({ session }) {
         const resolved = mergeReports(reports, cloudReports);
         const resolvedSettings = { ...defaultSettings(), ...cloudSettings, ...settings };
 
-        const resolvedSettings = { ...defaultSettings(), ...cloudSettings, ...settings };
-
         setReports(resolved); save(resolved);
         setSettings(resolvedSettings); saveSettings(resolvedSettings);
         cloudHasDataRef.current = countBookings(resolved) > 0;
