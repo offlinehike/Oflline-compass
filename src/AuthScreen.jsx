@@ -80,7 +80,6 @@ const S = {
     fontSize: 14,
     textAlign: "center",
   },
-  msgOk: { background: "#F0FDF4", color: "#16A34A" },
   msgErr: { background: "#FEF2F2", color: "#DC2626" },
   footer: {
     marginTop: 28,
@@ -92,28 +91,32 @@ const S = {
 
 export default function AuthScreen() {
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
-  const [sent, setSent] = useState(false);
   const [error, setError] = useState("");
 
   const handleLogin = async () => {
+    if (loading) return;
     const trimmed = email.trim().toLowerCase();
     if (trimmed !== ALLOWED_EMAIL) {
       setError("Access restricted. Use your registered email.");
       return;
     }
+    if (!password) {
+      setError("Enter your password.");
+      return;
+    }
     setLoading(true);
     setError("");
-    const { error: err } = await supabase.auth.signInWithOtp({
+    const { error: err } = await supabase.auth.signInWithPassword({
       email: trimmed,
-      options: { emailRedirectTo: window.location.origin },
+      password,
     });
     setLoading(false);
     if (err) {
-      setError(err.message);
-    } else {
-      setSent(true);
+      setError(err.message || "Couldn't sign in. Check your email and password.");
     }
+    // On success, main.jsx's auth listener swaps to the dashboard automatically.
   };
 
   const handleKey = (e) => {
@@ -125,34 +128,40 @@ export default function AuthScreen() {
       <div style={S.card}>
         <div style={S.logo}>🧭</div>
         <div style={S.title}>Offline Compass</div>
-        <div style={S.sub}>Trail & booking ledger · Mauritius</div>
+        <div style={S.sub}>Trail &amp; booking ledger · Mauritius</div>
 
-        {!sent ? (
-          <>
-            <label style={S.label}>Email</label>
-            <input
-              style={S.input}
-              type="email"
-              placeholder="offlinehike@gmail.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              onKeyDown={handleKey}
-              autoComplete="email"
-            />
-            <button
-              style={{ ...S.btn, ...(loading ? S.btnDisabled : {}) }}
-              onClick={handleLogin}
-              disabled={loading}
-            >
-              {loading ? "Sending…" : "Send Magic Link"}
-            </button>
-            {error && <div style={{ ...S.msg, ...S.msgErr }}>{error}</div>}
-          </>
-        ) : (
-          <div style={{ ...S.msg, ...S.msgOk }}>
-            ✅ Check your inbox — click the link in the email to sign in.
-          </div>
-        )}
+        <label style={S.label}>Email</label>
+        <input
+          style={S.input}
+          type="email"
+          placeholder="offlinehike@gmail.com"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          onKeyDown={handleKey}
+          autoComplete="email"
+          inputMode="email"
+        />
+
+        <label style={S.label}>Password</label>
+        <input
+          style={S.input}
+          type="password"
+          placeholder="••••••••"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={handleKey}
+          autoComplete="current-password"
+        />
+
+        <button
+          style={{ ...S.btn, ...(loading ? S.btnDisabled : {}) }}
+          onClick={handleLogin}
+          disabled={loading}
+        >
+          {loading ? "Signing in…" : "Sign in"}
+        </button>
+
+        {error && <div style={{ ...S.msg, ...S.msgErr }}>{error}</div>}
 
         <div style={S.footer}>Private access · Offline Compass Ltd</div>
       </div>

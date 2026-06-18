@@ -1,10 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { createClient } from "@supabase/supabase-js";
-
-// ── Supabase (auth + cloud sync) ───────────────────────────────────────
-const SUPABASE_URL = "https://ejxqywcamodooqwvqgrw.supabase.co";
-const SUPABASE_ANON_KEY = "sb_publishable_e9qM1qqsiel1qAU4CRO19g_rUp0hjv9";
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+import { supabase } from "./supabase";
 
 // ── Constants ──────────────────────────────────────────────────────────
 const EXPENSE_CATS = [
@@ -430,79 +425,8 @@ const guidePayForDay = (dayBookings) => {
 };
 const guidePayKey = (date, guide) => `${date}|${guide}`;
 
-// ── Auth gate ──────────────────────────────────────────────────────────
-// Wraps the whole app: shows the login screen until a Supabase session
-// exists, then renders the dashboard. Email + password only (no signup).
-export default function App() {
-  const [session, setSession] = useState(undefined); // undefined = still loading
-
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
-    return () => sub.subscription.unsubscribe();
-  }, []);
-
-  if (session === undefined) {
-    return (
-      <div style={S.authWrap}>
-        <style>{CSS}</style>
-        <div style={S.authCard}>
-          <div style={S.authBrand}>OFFLINE</div>
-          <p style={S.authHint}>Loading…</p>
-        </div>
-      </div>
-    );
-  }
-  if (!session) return <Login />;
-  return <TrailLedger session={session} />;
-}
-
-function Login() {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-
-  const submit = async () => {
-    if (busy) return;
-    setErr(""); setBusy(true);
-    const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
-    setBusy(false);
-    if (error) setErr(error.message || "Couldn't sign in. Check your email and password.");
-  };
-
-  return (
-    <div style={S.authWrap}>
-      <style>{CSS}</style>
-      <div style={S.authCard}>
-        <div style={S.authBrand}>OFFLINE</div>
-        <p style={S.authHint}>Sign in to your dashboard</p>
-        <div style={S.field}>
-          <label style={S.fieldLabel}>Email</label>
-          <input
-            style={S.input} type="email" autoComplete="email" inputMode="email"
-            value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@email.com"
-          />
-        </div>
-        <div style={S.field}>
-          <label style={S.fieldLabel}>Password</label>
-          <input
-            style={S.input} type="password" autoComplete="current-password"
-            value={password} onChange={(e) => setPassword(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") submit(); }} placeholder="••••••••"
-          />
-        </div>
-        {err ? <div style={S.authErr}>{err}</div> : null}
-        <button style={{ ...S.primaryBtn, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={submit}>
-          {busy ? "Signing in…" : "Sign in"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ── App ────────────────────────────────────────────────────────────────
-function TrailLedger({ session }) {
+// ── App (logged-in dashboard; auth handled in main.jsx) ────────────────
+export default function TrailLedger({ session }) {
   const now = new Date();
   const [year, setYear] = useState(now.getFullYear());
   const [month, setMonth] = useState(now.getMonth());
@@ -517,6 +441,8 @@ function TrailLedger({ session }) {
 
   // Alert dropdown (guide-less bookings) open/closed.
   const [alertOpen, setAlertOpen] = useState(false);
+  // Guide-payments dropdown open/closed.
+  const [payOpen, setPayOpen] = useState(false);
 
   // ── Cloud sync (Supabase) ─────────────────────────────────────────────
   // localStorage stays the instant, offline-first source; Supabase keeps every
@@ -706,18 +632,17 @@ function TrailLedger({ session }) {
     return out.slice(0, 20);
   }, [reports]);
 
-  // Action Required: confirmed (i.e. logged) bookings from today onward that have
-  // no guide assigned. A trip with nobody to run it is an operational risk.
+  // Action Required: any logged booking with no guide assigned — past or
+  // upcoming. Past dates are included on purpose: when entering historical
+  // data, this surfaces trips that were never properly recorded with a guide.
   const actionRequired = useMemo(() => {
-    const today = todayISO();
     const out = [];
     Object.keys(reports).forEach((date) => {
-      if (date < today) return; // only upcoming/today matter operationally
       reports[date].forEach((r, idx) => {
         if (!(r.staffNames || []).length) out.push({ date, idx, ...r });
       });
     });
-    out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    out.sort((a, b) => (a.date > b.date ? -1 : a.date < b.date ? 1 : 0)); // newest first
     return out;
   }, [reports]);
 
@@ -1150,44 +1075,60 @@ function TrailLedger({ session }) {
       <main style={S.main}>
         <MonthPicker year={year} month={month} setYear={setYear} setMonth={setMonth} />
 
-        {actionRequired.length > 0 && (
-          <div style={S.alertWrap}>
-            <button style={{ ...S.actionBanner, marginBottom: 0 }} onClick={() => setAlertOpen((o) => !o)}>
-              <span style={S.actionBannerIcon}>⚠</span>
-              <span style={S.actionBannerText}>
-                <strong>{actionRequired.length} booking{actionRequired.length !== 1 ? "s" : ""} need a guide</strong>
-                <span style={S.actionBannerSub}>Tap to choose which one to assign</span>
-              </span>
-              <span style={S.alertChevron}>{alertOpen ? "▲" : "▼"}</span>
-            </button>
-            {alertOpen && (
-              <div style={S.alertMenu}>
-                {actionRequired.map((b) => (
-                  <button
-                    key={`${b.date}|${b.idx}`}
-                    style={S.alertItem}
-                    onClick={() => { setAlertOpen(false); openSheet(b.date, b.idx); }}
-                  >
-                    <span style={S.alertItemMain}>{fmtShortDate(b.date)} · {b.activity}</span>
-                    <span style={S.alertItemSub}>{b.client || "—"} · {b.pax} pax · no guide</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
         {tab === "calendar" ? (
           <>
+            {actionRequired.length > 0 && (
+              <div style={S.alertWrap}>
+                <button style={{ ...S.actionBanner, marginBottom: 0 }} onClick={() => setAlertOpen((o) => !o)}>
+                  <span style={S.actionBannerIcon}>⚠</span>
+                  <span style={S.actionBannerText}>
+                    <strong>{actionRequired.length} booking{actionRequired.length !== 1 ? "s" : ""} need a guide</strong>
+                    <span style={S.actionBannerSub}>Tap to choose which one to assign</span>
+                  </span>
+                  <span style={S.alertChevron}>{alertOpen ? "▲" : "▼"}</span>
+                </button>
+                {alertOpen && (
+                  <div style={S.alertMenu}>
+                    {actionRequired.map((b) => (
+                      <button
+                        key={`${b.date}|${b.idx}`}
+                        style={S.alertItem}
+                        onClick={() => { setAlertOpen(false); openSheet(b.date, b.idx); }}
+                      >
+                        <span style={S.alertItemMain}>{fmtShortDate(b.date)} · {b.activity}</span>
+                        <span style={S.alertItemSub}>{b.client || "—"} · {b.pax} pax · no guide</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             {pendingGuidePay.length > 0 && (
-              <button style={S.payReminder} onClick={() => setTab("guides")}>
-                <span style={S.payReminderIcon}>⏰</span>
-                <span style={S.payReminderText}>
-                  <strong>{pendingGuidePay.length} guide payment{pendingGuidePay.length !== 1 ? "s" : ""} due</strong>
-                  <span style={S.payReminderSub}>Tap to review and mark paid</span>
-                </span>
-                <span style={S.payReminderAmt}>{fmt(pendingGuidePay.reduce((s, p) => s + p.amount, 0))}</span>
-              </button>
+              <div style={S.alertWrap}>
+                <button style={{ ...S.payReminder, marginBottom: 0 }} onClick={() => setPayOpen((o) => !o)}>
+                  <span style={S.payReminderIcon}>⏰</span>
+                  <span style={S.payReminderText}>
+                    <strong>{pendingGuidePay.length} guide payment{pendingGuidePay.length !== 1 ? "s" : ""} due</strong>
+                    <span style={S.payReminderSub}>Tap to choose a guide to review</span>
+                  </span>
+                  <span style={S.payReminderAmt}>{fmt(pendingGuidePay.reduce((s, p) => s + p.amount, 0))}</span>
+                  <span style={S.alertChevron}>{payOpen ? "▲" : "▼"}</span>
+                </button>
+                {payOpen && (
+                  <div style={S.alertMenu}>
+                    {pendingGuidePay.map((p) => (
+                      <button
+                        key={`${p.date}|${p.guide}`}
+                        style={S.alertItem}
+                        onClick={() => { setPayOpen(false); setTab("guides"); }}
+                      >
+                        <span style={S.alertItemMain}>{p.guide} · {fmt(p.amount)}</span>
+                        <span style={S.alertItemSub}>{fmtShortDate(p.date)} · tap to review in Guides</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
             <PasteBar onPaste={handlePaste} onOperatorPaste={handleOperatorPaste} onSmartPaste={handleSmartPaste} />
             <Calendar
@@ -2604,8 +2545,9 @@ function Calendar({ year, month, reports, onPick, onStep }) {
           const dayList = reports[iso] || [];
           const count = dayList.length;
           const isToday = iso === today;
-          // Alert day = today/future with at least one booking missing a guide.
-          const hasAlert = iso >= today && dayList.some((r) => !(r.staffNames || []).length);
+          // Alert day = any day with at least one booking missing a guide
+          // (past included, so historical gaps show up too).
+          const hasAlert = dayList.some((r) => !(r.staffNames || []).length);
           return (
             <button
               key={i}

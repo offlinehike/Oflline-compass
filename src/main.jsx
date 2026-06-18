@@ -13,7 +13,7 @@ function App() {
       setSession(session);
     });
 
-    // Listen for auth changes (magic link click)
+    // Listen for auth changes (sign in / sign out)
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
     });
@@ -43,8 +43,8 @@ function App() {
     return <AuthScreen />;
   }
 
-  // Logged in — show the app
-  return <TrailLedger />;
+  // Logged in — show the app, handing it the session so cloud sync knows the user
+  return <TrailLedger session={session} />;
 }
 
 createRoot(document.getElementById("root")).render(<App />);
