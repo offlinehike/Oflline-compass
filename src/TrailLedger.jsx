@@ -83,6 +83,29 @@ const fmtShortDate = (iso) => {
   } catch { return iso; }
 };
 
+// Count every booking across all dates (used to protect against empty wipes).
+const countBookings = (reports) =>
+  Object.values(reports || {}).reduce((n, arr) => n + (Array.isArray(arr) ? arr.length : 0), 0);
+
+// Merge two booking sets without losing anything: union per date, exact
+// duplicates removed. On a genuine conflict both versions are kept (a harmless
+// duplicate you can delete) rather than silently dropping one.
+const mergeReports = (a, b) => {
+  const out = {};
+  const dates = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
+  dates.forEach((d) => {
+    const la = (a && a[d]) || [];
+    const lb = (b && b[d]) || [];
+    const merged = [...la];
+    lb.forEach((item) => {
+      const key = JSON.stringify(item);
+      if (!merged.some((m) => JSON.stringify(m) === key)) merged.push(item);
+    });
+    if (merged.length) out[d] = merged;
+  });
+  return out;
+};
+
 const fmt = (n) => "Rs " + Number(n || 0).toLocaleString("en-IN");
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
@@ -445,12 +468,35 @@ export default function TrailLedger({ session }) {
   const [payOpen, setPayOpen] = useState(false);
 
   // ── Cloud sync (Supabase) ─────────────────────────────────────────────
-  // localStorage stays the instant, offline-first source; Supabase keeps every
-  // device in step. Pull once on login, then push (debounced) on every change.
+  // Design rule: NEVER lose bookings. localStorage is the instant offline
+  // source; Supabase keeps devices in step. Reconciliation merges the two sets
+  // and an empty copy can never overwrite a copy that has data.
   const [syncState, setSyncState] = useState("idle"); // idle|syncing|saved|offline|error
-  const hydratedRef = useRef(false); // true after first cloud pull completes
+  const hydratedRef = useRef(false);   // true after first cloud reconcile
+  const cloudHasDataRef = useRef(false); // true once we know real data exists somewhere
   const pushTimer = useRef(null);
 
+  const pushState = async (rep, set) => {
+    if (!session) return false;
+    if (!navigator.onLine) { setSyncState("offline"); return false; }
+    setSyncState("syncing");
+    const stamp = new Date().toISOString();
+    try {
+      const { error } = await supabase.from("app_state").upsert(
+        { user_id: session.user.id, reports: rep, settings: set, updated_at: stamp },
+        { onConflict: "user_id" }
+      );
+      if (error) throw error;
+      setStamp(stamp); setSyncState("saved");
+      if (countBookings(rep) > 0) cloudHasDataRef.current = true;
+      return true;
+    } catch {
+      setSyncState(navigator.onLine ? "error" : "offline");
+      return false;
+    }
+  };
+
+  // Reconcile on login: merge local + cloud so neither side's bookings are lost.
   useEffect(() => {
     if (!session) return;
     let cancelled = false;
@@ -459,66 +505,68 @@ export default function TrailLedger({ session }) {
       try {
         const { data, error } = await supabase
           .from("app_state")
-          .select("reports, settings, updated_at")
+          .select("reports, settings")
           .eq("user_id", session.user.id)
           .maybeSingle();
         if (error) throw error;
-        const localStamp = getStamp();
-        const cloudNewer = !localStamp || Date.parse(data?.updated_at || 0) > Date.parse(localStamp);
-        if (!cancelled && data && cloudNewer) {
-          if (data.reports) { setReports(data.reports); save(data.reports); }
-          if (data.settings) {
-            const merged = { ...defaultSettings(), ...data.settings };
-            setSettings(merged); saveSettings(merged);
-          }
-          setStamp(data.updated_at || "");
+        if (cancelled) return;
+
+        const cloudReports = (data && data.reports) || {};
+        const cloudSettings = (data && data.settings) || {};
+        const localReports = reports;
+        const lc = countBookings(localReports);
+        const cc = countBookings(cloudReports);
+
+        // Choose the safe resolution: union when both have data, otherwise
+        // keep whichever is non-empty. Empty never wins.
+        let resolved;
+        if (lc > 0 && cc > 0) resolved = mergeReports(localReports, cloudReports);
+        else if (cc > 0) resolved = cloudReports;
+        else resolved = localReports; // cloud empty → keep local (may be empty too)
+
+        const resolvedSettings = { ...defaultSettings(), ...cloudSettings, ...settings };
+
+        setReports(resolved); save(resolved);
+        setSettings(resolvedSettings); saveSettings(resolvedSettings);
+        cloudHasDataRef.current = countBookings(resolved) > 0;
+        hydratedRef.current = true;
+
+        // Repair/seed the cloud if our resolved view differs from it.
+        if (JSON.stringify(resolved) !== JSON.stringify(cloudReports) ||
+            JSON.stringify(resolvedSettings) !== JSON.stringify(cloudSettings)) {
+          await pushState(resolved, resolvedSettings);
+        } else {
+          setSyncState("saved");
         }
-        if (!cancelled) setSyncState("saved");
       } catch {
         if (!cancelled) setSyncState(navigator.onLine ? "error" : "offline");
-      } finally {
-        hydratedRef.current = true;
+        hydratedRef.current = true; // still allow local-only use
       }
     })();
     return () => { cancelled = true; };
   }, [session]);
 
-  // Push the whole state up, debounced. Waits for the first pull so the empty
-  // initial state can never overwrite real cloud data.
+  // Push on change, debounced. Guard: refuse to push an empty set over a cloud
+  // that we know holds data — that was the bug that wiped bookings.
   useEffect(() => {
     if (!session || !hydratedRef.current) return;
     if (pushTimer.current) clearTimeout(pushTimer.current);
-    pushTimer.current = setTimeout(async () => {
-      if (!navigator.onLine) { setSyncState("offline"); return; }
-      setSyncState("syncing");
-      const stamp = new Date().toISOString();
-      try {
-        const { error } = await supabase.from("app_state").upsert(
-          { user_id: session.user.id, reports, settings, updated_at: stamp },
-          { onConflict: "user_id" }
-        );
-        if (error) throw error;
-        setStamp(stamp); setSyncState("saved");
-      } catch {
-        setSyncState(navigator.onLine ? "error" : "offline");
+    pushTimer.current = setTimeout(() => {
+      if (countBookings(reports) === 0 && cloudHasDataRef.current) {
+        setSyncState("saved"); // protect existing cloud data; nothing to push
+        return;
       }
+      pushState(reports, settings);
     }, 1200);
     return () => { if (pushTimer.current) clearTimeout(pushTimer.current); };
   }, [reports, settings, session]);
 
-  // When the connection comes back, flush whatever is on the device.
+  // Flush when connectivity returns (same empty-guard).
   useEffect(() => {
-    const flush = async () => {
+    const flush = () => {
       if (!session || !hydratedRef.current) return;
-      const stamp = new Date().toISOString();
-      try {
-        const { error } = await supabase.from("app_state").upsert(
-          { user_id: session.user.id, reports, settings, updated_at: stamp },
-          { onConflict: "user_id" }
-        );
-        if (error) throw error;
-        setStamp(stamp); setSyncState("saved");
-      } catch { setSyncState("error"); }
+      if (countBookings(reports) === 0 && cloudHasDataRef.current) return;
+      pushState(reports, settings);
     };
     window.addEventListener("online", flush);
     return () => window.removeEventListener("online", flush);
