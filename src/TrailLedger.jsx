@@ -1,40 +1,16 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { supabase } from "./supabase";
+import {
+  EXPENSE_CATS, ACTIVITIES, ACTIVITY_PRICE, FRESHVERDE_PRICE, SOURCES,
+  MONTHS, PAYMENTS, STAFF, STORE_KEY, SETTINGS_KEY, FOOD_PER_PAX,
+} from "./domain/constants";
+import { fmt, todayISO, fmtShortDate, downloadBlob, csvCell, isoFor } from "./util/format";
 
-// ── Constants ──────────────────────────────────────────────────────────
-const EXPENSE_CATS = [
-  { key: "food", label: "Food & Bev" },
-  { key: "fuel", label: "Fuel" },
-  { key: "staff", label: "Staff" },
-  { key: "commission", label: "Commission" },
-];
-const ACTIVITIES = ["Pieter Both", "7 Cascades Hiking", "Canyoning 7 Cascades", "Le Morne", "Le Pouce"];
-const ACTIVITY_PRICE = {
-  "Pieter Both": 4000,
-  "7 Cascades Hiking": 2000,
-  "Canyoning 7 Cascades": 4000,
-  "Le Morne": 2000,
-  "Le Pouce": 2000,
-}; // per person — direct bookings
-
-// Freshverde operator price list (per person). Pieter Both falls back to direct.
-const FRESHVERDE_PRICE = {
-  "Pieter Both": 4000,
-  "7 Cascades Hiking": 1500,
-  "Canyoning 7 Cascades": 3000,
-  "Le Morne": 1500,
-  "Le Pouce": 1500,
-};
-
-const SOURCES = ["Direct", "Freshverde"];
 // Per-person price for an activity given the booking source.
 const priceFor = (activity, source) => {
   const table = source === "Freshverde" ? FRESHVERDE_PRICE : ACTIVITY_PRICE;
   return table[activity] != null ? table[activity] : 0;
 };
-const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
-const PAYMENTS = ["Cash", "Card", "Transfer", "Unpaid"];
-const STAFF = ["Darryl", "Gayan", "Tirou", "Steeve", "Nesta"];
 // Staff pay per staff member, by activity. Some depend on pax (≥4 = higher).
 const staffRate = (activity, pax) => {
   const p = Number(pax) || 0;
@@ -47,11 +23,6 @@ const staffRate = (activity, pax) => {
     default: return 1500;
   }
 };
-const STORE_KEY = "trailledger.v1";
-const SETTINGS_KEY = "trailledger.settings.v1";
-
-// Auto-calc rates
-const FOOD_PER_PAX = 200; // Rs per person
 
 // ── Storage (localStorage; data persists on your device) ───────────────
 const load = () => {
@@ -75,13 +46,6 @@ const saveSettings = (data) => {
 const STAMP_KEY = "trailledger.syncedAt";
 const getStamp = () => { try { return localStorage.getItem(STAMP_KEY) || ""; } catch { return ""; } };
 const setStamp = (s) => { try { localStorage.setItem(STAMP_KEY, s); } catch {} };
-
-// Short, friendly date for the alert dropdown (e.g. "Sat 21 Jun").
-const fmtShortDate = (iso) => {
-  try {
-    return new Date(iso + "T00:00:00").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
-  } catch { return iso; }
-};
 
 // Count every booking across all dates (used to protect against empty wipes).
 const countBookings = (reports) =>
@@ -114,26 +78,6 @@ const mergeReports = (a, b) => {
   });
   return out;
 };
-
-const fmt = (n) => "Rs " + Number(n || 0).toLocaleString("en-IN");
-const todayISO = () => new Date().toISOString().slice(0, 10);
-
-// Trigger a file download in the browser.
-const downloadBlob = (blob, filename) => {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-};
-
-// Escape a value for CSV (quotes, commas, newlines).
-const csvCell = (v) => {
-  const s = String(v ?? "");
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-};
-const isoFor = (y, m, d) => `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
 
 const emptyForm = () => ({
   activity: "Pieter Both", client: "", pax: 1, price: String(ACTIVITY_PRICE["Pieter Both"]), payment: "Cash",
