@@ -5,24 +5,7 @@ import {
   MONTHS, PAYMENTS, STAFF, STORE_KEY, SETTINGS_KEY, FOOD_PER_PAX,
 } from "./domain/constants";
 import { fmt, todayISO, fmtShortDate, downloadBlob, csvCell, isoFor } from "./util/format";
-
-// Per-person price for an activity given the booking source.
-const priceFor = (activity, source) => {
-  const table = source === "Freshverde" ? FRESHVERDE_PRICE : ACTIVITY_PRICE;
-  return table[activity] != null ? table[activity] : 0;
-};
-// Staff pay per staff member, by activity. Some depend on pax (≥4 = higher).
-const staffRate = (activity, pax) => {
-  const p = Number(pax) || 0;
-  switch (activity) {
-    case "Canyoning 7 Cascades": return 2500;
-    case "Pieter Both": return 3000;
-    case "7 Cascades Hiking": return p >= 4 ? 2000 : 1500;
-    case "Le Morne": return p >= 4 ? 2000 : 1500;
-    case "Le Pouce": return p >= 4 ? 2000 : 1500;
-    default: return 1500;
-  }
-};
+import { priceFor, staffRate, fuelRate, incomeOf, staffCostOf } from "./domain/pricing";
 
 // ── Storage (localStorage; data persists on your device) ───────────────
 const load = () => {
@@ -309,9 +292,6 @@ const expenseTotalWith = (r, staffCost, fuelCost) =>
     return s + Number(r[c.key] || 0);
   }, 0);
 
-// Fuel = Rs 700 only if Darryl is on the crew, otherwise Rs 0
-const fuelRate = (staffNames) => (staffNames || []).includes("Darryl") ? 700 : 0;
-
 // Effective staff cost for a single booking, given all bookings on its day.
 const staffCostFor = (dayBookings, idx) => dayCosts(dayBookings).staff[idx];
 // Effective total expense for a booking within its day (grouped staff + fuel).
@@ -319,13 +299,6 @@ const effExpense = (dayBookings, idx) => {
   const c = dayCosts(dayBookings);
   return expenseTotalWith(dayBookings[idx], c.staff[idx], c.fuel[idx]);
 };
-
-// Income = pax × per-person price
-const incomeOf = (r) => (Number(r.pax) || 0) * (Number(r.price) || 0);
-
-// Staff cost = per-activity rate × number of staff on the trip
-const staffCostOf = (r) =>
-  (r.staffNames ? r.staffNames.length : 0) * staffRate(r.activity, r.pax);
 
 // Which cash account a booking's income lands in.
 // Freshverde always pays into the bank (monthly), so its income is bank — never hand.
