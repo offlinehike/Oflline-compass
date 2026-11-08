@@ -3,9 +3,11 @@ import { createRoot } from "react-dom/client";
 import { supabase } from "./supabase";
 import AuthScreen from "./AuthScreen";
 import TrailLedger from "./TrailLedger";
+import ResetPassword from "./ResetPassword";
 
 function App() {
   const [session, setSession] = useState(undefined); // undefined = loading
+  const [recovery, setRecovery] = useState(false); // true while setting a new password
 
   useEffect(() => {
     // Get initial session
@@ -14,7 +16,8 @@ function App() {
     });
 
     // Listen for auth changes (sign in / sign out)
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "PASSWORD_RECOVERY") setRecovery(true);
       setSession(session);
     });
 
@@ -37,6 +40,9 @@ function App() {
       </div>
     );
   }
+
+  // Arrived via a password-recovery email link: ask for a new password first
+  if (recovery) return <ResetPassword onDone={() => setRecovery(false)} />;
 
   // Not logged in
   if (!session) {

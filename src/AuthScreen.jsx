@@ -94,6 +94,17 @@ export default function AuthScreen() {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+
+  const handleForgot = async () => {
+    setError("");
+    setInfo("");
+    const { error: err } = await supabase.auth.resetPasswordForEmail(ALLOWED_EMAIL, {
+      redirectTo: window.location.origin,
+    });
+    if (err) setError(err.message);
+    else setInfo("Reset link sent to " + ALLOWED_EMAIL);
+  };
 
   const handleLogin = async () => {
     if (loading) return;
@@ -161,6 +172,14 @@ export default function AuthScreen() {
           {loading ? "Signing in…" : "Sign in"}
         </button>
 
+        <button
+          onClick={handleForgot}
+          style={{ marginTop: 14, width: "100%", background: "none", border: "none", color: "#F97316", fontSize: 14, cursor: "pointer" }}
+        >
+          Forgot password?
+        </button>
+
+        {info && <div style={{ ...S.msg, background: "#F0FDF4", color: "#16A34A" }}>{info}</div>}
         {error && <div style={{ ...S.msg, ...S.msgErr }}>{error}</div>}
 
         <div style={S.footer}>Private access · Offline Compass Ltd</div>
